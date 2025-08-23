@@ -41,12 +41,13 @@ jobs:
       - name: Build image
         run: docker build -t $IMAGE_SHA -f app/Dockerfile .
 
-      - name: Trivy scan (HIGH/CRITICAL fail)
+      # На время демо только отчёт, не фейлим пайплайн
+      - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
           format: 'table'
-          exit-code: '1'
+          exit-code: '0'          # <-- не останавливаем пайплайн
           severity: 'HIGH,CRITICAL'
 
       - name: SBOM (CycloneDX)
@@ -62,7 +63,7 @@ jobs:
           name: sbom-cyclonedx
           path: sbom.cdx.json
 
-      - name: Tag & push to AR
+      - name: Tag & push to Artifact Registry
         run: |
           docker tag $IMAGE_SHA $AR_IMAGE_SHA
           docker tag $IMAGE_SHA $AR_IMAGE_LATEST

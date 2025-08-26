@@ -38,11 +38,9 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      # Сборка из КОРНЕВОГО Dockerfile
       - name: Build image (root Dockerfile)
         run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
-      # Security: Trivy report-only (не роняем пайплайн)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:

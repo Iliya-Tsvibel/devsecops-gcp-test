@@ -47,7 +47,7 @@ jobs:
         with:
           image-ref: ${{ env.IMAGE_SHA }}
           format: 'table'
-          exit-code: '0'          # <-- не останавливаем пайплайн
+          exit-code: '0'
           severity: 'HIGH,CRITICAL'
 
       - name: SBOM (CycloneDX)
@@ -77,7 +77,24 @@ jobs:
             --region $REGION \
             --service-account $RUNTIME_SA \
             --allow-unauthenticated \
-            --platform managed
+            --platform managed \
+            --port 8080 \
+            --max-instances 3 \
+            --timeout 300
 
       - name: Show Cloud Run URL
         run: gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)'
+
+      - name: Smoke check (root + /info)
+        run: |
+          set -euo pipefail
+          URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)')
+          echo "Testing URL: $URL"
+
+          echo "→ Check /"
+          curl -fsS "$URL/" | grep -q '^ok$'
+
+          echo "→ Check /info"
+          curl -fsS "$URL/info" | grep -q 'APP_TOKEN='
+
+          echo "Smoke check passed ✅"

@@ -2,10 +2,9 @@ name: build-scan-deploy
 
 on:
   push:
-    branches: [ "main" ]
-  # Run CI also on PRs (can be removed if not needed)
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +43,6 @@ jobs:
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
       - name: Build image (root Dockerfile)
-        # Root-level Dockerfile is used to build the single image
         run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
       # Vulnerability scan (report only; does NOT fail the pipeline)
@@ -52,16 +50,16 @@ jobs:
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
-          format: 'table'
-          exit-code: '0'
-          severity: 'HIGH,CRITICAL'
+          format: table
+          exit-code: "0"
+          severity: HIGH,CRITICAL
 
       - name: SBOM (CycloneDX)
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
-          format: 'cyclonedx'
-          output: 'sbom.cdx.json'
+          format: cyclonedx
+          output: sbom.cdx.json
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -91,7 +89,7 @@ jobs:
       - name: Show Cloud Run URL
         run: gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)'
 
-      - name: Smoke check (Cloud Run, robust)
+      - name: Smoke check (public URL; no /healthz)
         shell: bash
         run: |
           set -euo pipefail
@@ -101,7 +99,7 @@ jobs:
           echo "=== Service status before wait ==="
           gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='yaml(status)'
 
-          # Wait until Ready=True (max ~10 minutes, 120 * 5s)
+          # Wait up to 10 minutes for Ready=True (120 * 5s)
           attempts=0
           until gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
                  --format='get(status.conditions[?type="Ready"].status)' | grep -q '^True$'; do
@@ -116,7 +114,7 @@ jobs:
 
           check() {
             local path="$1" expect="$2"
-            local max=15
+            local max=12
             for i in $(seq 1 $max); do
               resp="$(curl -fsS -L "$svc_url$path" -w '\n%{http_code}' --connect-timeout 5 --max-time 10 || true)"
               code="$(printf '%s\n' "$resp" | tail -n1)"
@@ -124,26 +122,24 @@ jobs:
               echo "[$path] http=$code payload=$(echo "$body" | head -c 120 | tr '\n' ' ')"
               if [ "$code" = "200" ]; then
                 case "$expect" in
-                  ok)        printf '%s' "$body" | tr -d '\r' | grep -q '^ok$' && return 0 ;;
+                  ok)        printf '%s' "$body" | tr -d '\r' | grep -q '"status":"ok"' && return 0 ;;
                   has_token) printf '%s' "$body" | grep -q 'APP_TOKEN=' && return 0 ;;
                 esac
               fi
-              sleep $(( i < 7 ? 3 : 6 ))
+              sleep $(( i < 6 ? 3 : 6 ))
             done
             echo "Check $path failed after $max attempts" >&2
             echo "Last body:"; echo "$body"
             return 1
           }
 
-          # server.py: "/" and "/healthz" → "ok"; "/info" → contains APP_TOKEN
-          check "/"        ok
-          check "/healthz" ok
-          check "/info"    has_token
+          # Do NOT use /healthz on *.a.run.app — it's intercepted by Google Frontend
+          check "/"     ok
+          check "/info" has_token
 
           echo "Cloud Run smoke passed ✅"
 
-      # Optional debug (does not fail the job). 
-      # Requires roles/logging.viewer for the deploy service account.
+      # Optional debug (doesn't fail the job). To see logs, the deploy SA needs roles/logging.viewer.
       - name: Debug — service/revision conditions & logs
         if: failure()
         continue-on-error: true

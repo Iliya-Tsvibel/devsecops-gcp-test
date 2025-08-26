@@ -39,10 +39,9 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Build image
-        run: docker build -t $IMAGE_SHA -f app/Dockerfile .
+      - name: Build image (root Dockerfile)
+        run: docker build -t $IMAGE_SHA -f Dockerfile .
 
-      # На время демо только отчёт, не фейлим пайплайн
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
@@ -63,6 +62,18 @@ jobs:
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json
+
+      - name: Local smoke (/, /healthz, /info)
+        run: |
+          set -euo pipefail
+          cid=$(docker run -d -p 8080:8080 $IMAGE_SHA)
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:8080/healthz | grep -q '^ok$'; then break; fi
+            sleep 0.5
+          done
+          echo "→ /";     curl -fsS http://127.0.0.1:8080/ | grep -q '^ok$'
+          echo "→ /info"; curl -fsS http://127.0.0.1:8080/info | grep -q 'APP_TOKEN='
+          docker rm -f "$cid"
 
       - name: Tag & push to Artifact Registry
         run: |
@@ -86,16 +97,12 @@ jobs:
       - name: Show Cloud Run URL
         run: gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)'
 
-      - name: Smoke check (/, /info)
+      - name: Smoke check (Cloud Run)
         run: |
           set -euo pipefail
           URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)')
           echo "Testing URL: $URL"
-
-          echo "→ Check /"
           curl -fsS "$URL/" | grep -q '^ok$'
-
-          echo "→ Check /info"
+          curl -fsS "$URL/healthz" | grep -q '^ok$'
           curl -fsS "$URL/info" | grep -q 'APP_TOKEN='
-
-          echo "Smoke check passed ✅"
+          echo "Cloud Run smoke passed ✅"

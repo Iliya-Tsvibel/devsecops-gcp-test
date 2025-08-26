@@ -17,3 +17,26 @@ infra/terraform.tfvars
 # Python кэш
 __pycache__/
 *.pyc
+# Terraform local
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+terraform.tfvars
+
+# Python
+__pycache__/
+*.pyc
+
+# Docker/Build
+*.tar
+*.log
+
+# Вложенная папка (не коммитить её как сабмодуль)
+devsecops-gcp-test/

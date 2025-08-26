@@ -2,20 +2,24 @@ name: build-scan-deploy
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
+# OIDC + minimal read perms for checkout
 permissions:
   id-token: write
   contents: read
 
 env:
+  # Set these as Repository → Settings → Variables
   PROJECT_ID: ${{ vars.PROJECT_ID }}
-  REGION: ${{ vars.REGION }}
-  AR_HOST: ${{ vars.AR_HOST }}
-  REPO: ${{ vars.REPO }}
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+  REGION: ${{ vars.REGION }}                    # e.g. europe-west1
+  AR_HOST: ${{ vars.AR_HOST }}                  # e.g. europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}                        # e.g. services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}        # e.g. devsecops-demo
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}            # runtime-sa@<project>.iam.gserviceaccount.com
+
+  # Image tags
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
   AR_IMAGE_SHA: ${{ vars.AR_HOST }}/${{ vars.PROJECT_ID }}/${{ vars.REPO }}/${{ vars.SERVICE_NAME }}:${{ github.sha }}
@@ -27,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # OIDC auth to GCP (use two repository SECRETS below)
       - name: Auth to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -39,9 +44,11 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Build image (root Dockerfile)
-        run: docker build -t $IMAGE_SHA -f Dockerfile .
+      # IMPORTANT: Dockerfile is at repo root. If you move it to /app, change -f accordingly.
+      - name: Build image
+        run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
+      # Security scan (non-blocking for demo)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
@@ -63,31 +70,19 @@ jobs:
           name: sbom-cyclonedx
           path: sbom.cdx.json
 
-      - name: Local smoke (/, /healthz, /info)
-        run: |
-          set -euo pipefail
-          cid=$(docker run -d -p 8080:8080 $IMAGE_SHA)
-          for i in {1..20}; do
-            if curl -fsS http://127.0.0.1:8080/healthz | grep -q '^ok$'; then break; fi
-            sleep 0.5
-          done
-          echo "→ /";     curl -fsS http://127.0.0.1:8080/ | grep -q '^ok$'
-          echo "→ /info"; curl -fsS http://127.0.0.1:8080/info | grep -q 'APP_TOKEN='
-          docker rm -f "$cid"
-
       - name: Tag & push to Artifact Registry
         run: |
-          docker tag $IMAGE_SHA $AR_IMAGE_SHA
-          docker tag $IMAGE_SHA $AR_IMAGE_LATEST
-          docker push $AR_IMAGE_SHA
-          docker push $AR_IMAGE_LATEST
+          docker tag "$IMAGE_SHA" "$AR_IMAGE_SHA"
+          docker tag "$IMAGE_SHA" "$AR_IMAGE_LATEST"
+          docker push "$AR_IMAGE_SHA"
+          docker push "$AR_IMAGE_LATEST"
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run deploy $SERVICE_NAME \
-            --image $AR_IMAGE_SHA \
-            --region $REGION \
-            --service-account $RUNTIME_SA \
+          gcloud run deploy "$SERVICE_NAME" \
+            --image "$AR_IMAGE_SHA" \
+            --region "$REGION" \
+            --service-account "$RUNTIME_SA" \
             --allow-unauthenticated \
             --platform managed \
             --port 8080 \
@@ -95,14 +90,60 @@ jobs:
             --timeout 300
 
       - name: Show Cloud Run URL
-        run: gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)'
+        run: gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)'
 
-      - name: Smoke check (Cloud Run)
+      # Robust smoke test with retries and helpful logs
+      - name: Smoke check (Cloud Run, robust)
         run: |
           set -euo pipefail
-          URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)')
-          echo "Testing URL: $URL"
-          curl -fsS "$URL/" | grep -q '^ok$'
-          curl -fsS "$URL/healthz" | grep -q '^ok$'
-          curl -fsS "$URL/info" | grep -q 'APP_TOKEN='
+
+          svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
+          echo "Testing URL: $svc_url"
+
+          # Wait for Ready condition (up to 3 minutes)
+          attempts=0
+          until gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
+                 --format='get(status.conditions[?type="Ready"].status)' | grep -q '^True$'; do
+            attempts=$((attempts+1))
+            if [ "$attempts" -gt 36 ]; then
+              echo "Service did not become Ready in time" >&2
+              exit 1
+            fi
+            echo "Waiting for Ready... ($attempts/36)"
+            sleep 5
+          done
+
+          check() {
+            local path="$1" expect="$2"
+            local max=10
+            for i in $(seq 1 $max); do
+              resp="$(curl -fsS -L "$svc_url$path" -w '\n%{http_code}' --connect-timeout 5 --max-time 10 || true)"
+              code="$(printf '%s\n' "$resp" | tail -n1)"
+              body="$(printf '%s\n' "$resp" | sed '$d')"
+              echo "[$path] http=$code payload=$(echo "$body" | head -c 120 | tr '\n' ' ')"
+              if [ "$code" = "200" ]; then
+                case "$expect" in
+                  ok)        printf '%s' "$body" | tr -d '\r' | grep -q '^ok$' && return 0 ;;
+                  has_token) printf '%s' "$body" | grep -q 'APP_TOKEN=' && return 0 ;;
+                esac
+              fi
+              sleep $(( i < 5 ? 2 : 5 ))
+            done
+            echo "Check $path failed after $max attempts" >&2
+            echo "Last body:"; echo "$body"
+            return 1
+          }
+
+          # Your app returns "ok" on / and /healthz; /info includes APP_TOKEN
+          check "/"        ok
+          check "/healthz" ok
+          check "/info"    has_token
+
           echo "Cloud Run smoke passed ✅"
+
+      # Optional: quick debug dump if something flakes
+      - name: Debug — deployed image and traffic
+        if: failure()
+        run: |
+          gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
+            --format='yaml(spec.template.spec.containers[0].image,status.traffic)'

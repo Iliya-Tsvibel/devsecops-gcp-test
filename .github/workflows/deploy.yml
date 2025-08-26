@@ -3,7 +3,7 @@ name: build-scan-deploy
 on:
   push:
     branches: [ "main" ]
-  # Гонять CI на PR — удобно (можно убрать, если не нужно)
+  # Run CI also on PRs (can be removed if not needed)
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -15,9 +15,9 @@ permissions:
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
   REGION: ${{ vars.REGION }}
-  AR_HOST: ${{ vars.AR_HOST }}              # eg: europe-west1-docker.pkg.dev
-  REPO: ${{ vars.REPO }}                    # eg: services
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # eg: devsecops-demo
+  AR_HOST: ${{ vars.AR_HOST }}              # e.g. europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}                    # e.g. services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # e.g. devsecops-demo
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # runtime-sa@<project-id>.iam.gserviceaccount.com
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
@@ -44,10 +44,10 @@ jobs:
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
       - name: Build image (root Dockerfile)
-        # Dockerfile в корне репо; собираем единый образ
+        # Root-level Dockerfile is used to build the single image
         run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
-      # Vulnerability scan (report only; НЕ валит пайплайн)
+      # Vulnerability scan (report only; does NOT fail the pipeline)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
@@ -101,7 +101,7 @@ jobs:
           echo "=== Service status before wait ==="
           gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='yaml(status)'
 
-          # Ждём Ready до ~10 минут (120 * 5с)
+          # Wait until Ready=True (max ~10 minutes, 120 * 5s)
           attempts=0
           until gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
                  --format='get(status.conditions[?type="Ready"].status)' | grep -q '^True$'; do
@@ -135,14 +135,15 @@ jobs:
             return 1
           }
 
-          # Твой server.py: "/" и "/healthz" → "ok", "/info" → содержит APP_TOKEN
+          # server.py: "/" and "/healthz" → "ok"; "/info" → contains APP_TOKEN
           check "/"        ok
           check "/healthz" ok
           check "/info"    has_token
 
           echo "Cloud Run smoke passed ✅"
 
-      # Optional debug (не валит job). Для логов у deploy SA должна быть роль roles/logging.viewer
+      # Optional debug (does not fail the job). 
+      # Requires roles/logging.viewer for the deploy service account.
       - name: Debug — service/revision conditions & logs
         if: failure()
         continue-on-error: true

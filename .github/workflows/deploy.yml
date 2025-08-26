@@ -3,6 +3,9 @@ name: build-scan-deploy
 on:
   push:
     branches: [ "main" ]
+  # Гонять CI на PR — удобно (можно убрать, если не нужно)
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -12,11 +15,10 @@ permissions:
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
   REGION: ${{ vars.REGION }}
-  AR_HOST: ${{ vars.AR_HOST }} # e.g. europe-west1-docker.pkg.dev
-  REPO: ${{ vars.REPO }}       # e.g. services
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}   # e.g. devsecops-demo
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}       # runtime-sa@<project>.iam.gserviceaccount.com
-
+  AR_HOST: ${{ vars.AR_HOST }}              # eg: europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}                    # eg: services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # eg: devsecops-demo
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # runtime-sa@<project-id>.iam.gserviceaccount.com
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
   AR_IMAGE_SHA: ${{ vars.AR_HOST }}/${{ vars.PROJECT_ID }}/${{ vars.REPO }}/${{ vars.SERVICE_NAME }}:${{ github.sha }}
@@ -41,11 +43,11 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Build image
-        # Dockerfile is at repo root
-        run: docker build -t "$IMAGE_SHA" .
+      - name: Build image (root Dockerfile)
+        # Dockerfile в корне репо; собираем единый образ
+        run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
-      # Vulnerability scan (report only; does NOT fail the pipeline)
+      # Vulnerability scan (report only; НЕ валит пайплайн)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
@@ -90,6 +92,7 @@ jobs:
         run: gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)'
 
       - name: Smoke check (Cloud Run, robust)
+        shell: bash
         run: |
           set -euo pipefail
           svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
@@ -98,7 +101,7 @@ jobs:
           echo "=== Service status before wait ==="
           gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='yaml(status)'
 
-          # wait up to 10 minutes for Ready=True (120 * 5s)
+          # Ждём Ready до ~10 минут (120 * 5с)
           attempts=0
           until gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
                  --format='get(status.conditions[?type="Ready"].status)' | grep -q '^True$'; do
@@ -132,14 +135,14 @@ jobs:
             return 1
           }
 
-          # your app: "/" and "/healthz" -> "ok", "/info" -> includes APP_TOKEN
+          # Твой server.py: "/" и "/healthz" → "ok", "/info" → содержит APP_TOKEN
           check "/"        ok
           check "/healthz" ok
           check "/info"    has_token
 
           echo "Cloud Run smoke passed ✅"
 
-      # Optional debug (doesn't fail the job). To see logs, the SA needs roles/logging.viewer.
+      # Optional debug (не валит job). Для логов у deploy SA должна быть роль roles/logging.viewer
       - name: Debug — service/revision conditions & logs
         if: failure()
         continue-on-error: true

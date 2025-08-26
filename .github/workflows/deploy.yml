@@ -11,9 +11,9 @@ permissions:
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
   REGION: ${{ vars.REGION }}
-  AR_HOST: ${{ vars.AR_HOST }}              # напр. europe-west1-docker.pkg.dev
-  REPO: ${{ vars.REPO }}                    # напр. services
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # напр. devsecops-demo
+  AR_HOST: ${{ vars.AR_HOST }}              # eg: europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}                    # eg: services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # eg: devsecops-demo
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # runtime-sa@<project-id>.iam.gserviceaccount.com
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
@@ -88,7 +88,7 @@ jobs:
           svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
           echo "URL: $svc_url"
 
-          # Ждём Ready до 10 минут (120 попыток по 5 сек)
+          # Wait Ready up to 10 minutes (120 x 5s)
           for i in $(seq 1 120); do
             ready="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
               --format='get(status.conditions[?type="Ready"].status)')"
@@ -116,7 +116,7 @@ jobs:
             echo "Check $path failed after $max attempts"; echo "Last body:"; echo "$body"; return 1
           }
 
-          # server.py отдаёт "ok" на /, /healthz, /ping; /info содержит APP_TOKEN
+          # server.py: "ok" на / и /healthz, /info содержит APP_TOKEN
           check "/"        ok
           check "/healthz" ok
           check "/info"    has_token
@@ -134,7 +134,6 @@ jobs:
           echo "Latest revision: $rev"
           gcloud run revisions describe "$rev" --region "$REGION" --format='yaml(status.conditions)'
 
-          # Может потребоваться роль logs.viewer для деплой-СА
           gcloud logging read \
             'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.SERVICE_NAME }}"' \
             --project "${{ env.PROJECT_ID }}" --limit 50 \

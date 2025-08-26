@@ -14,5 +14,5 @@ RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
 USER appuser
 
 EXPOSE 8080
-# server.py слушает $PORT и отдаёт "ok" на / и /healthz
+# server.py слушает $PORT и отдаёт "ok" на / и /healthz, /info — APP_TOKEN
 CMD ["python","server.py"]

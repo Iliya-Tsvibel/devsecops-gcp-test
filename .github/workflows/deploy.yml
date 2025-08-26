@@ -88,7 +88,7 @@ jobs:
           svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
           echo "URL: $svc_url"
 
-          # Wait Ready up to 10 minutes (120 x 5s)
+          # Wait Ready до 10 минут (120 * 5c)
           for i in $(seq 1 120); do
             ready="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
               --format='get(status.conditions[?type="Ready"].status)')"

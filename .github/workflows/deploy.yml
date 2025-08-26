@@ -11,10 +11,10 @@ permissions:
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
   REGION: ${{ vars.REGION }}
-  AR_HOST: ${{ vars.AR_HOST }}
-  REPO: ${{ vars.REPO }}
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+  AR_HOST: ${{ vars.AR_HOST }}              # напр. europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}                    # напр. services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}    # напр. devsecops-demo
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # runtime-sa@<project-id>.iam.gserviceaccount.com
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
   AR_IMAGE_SHA: ${{ vars.AR_HOST }}/${{ vars.PROJECT_ID }}/${{ vars.REPO }}/${{ vars.SERVICE_NAME }}:${{ github.sha }}
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Auth to GCP
+      - name: Auth to GCP (WIF)
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
@@ -38,16 +38,17 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Build image
-        run: docker build -t $IMAGE_SHA -f app/Dockerfile .
+      # Сборка из КОРНЕВОГО Dockerfile
+      - name: Build image (root Dockerfile)
+        run: docker build -t "$IMAGE_SHA" -f Dockerfile .
 
-      # На время демо только отчёт, не фейлим пайплайн
+      # Security: Trivy report-only (не роняем пайплайн)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
           format: 'table'
-          exit-code: '0'          # <-- не останавливаем пайплайн
+          exit-code: '0'
           severity: 'HIGH,CRITICAL'
 
       - name: SBOM (CycloneDX)
@@ -65,19 +66,78 @@ jobs:
 
       - name: Tag & push to Artifact Registry
         run: |
-          docker tag $IMAGE_SHA $AR_IMAGE_SHA
-          docker tag $IMAGE_SHA $AR_IMAGE_LATEST
-          docker push $AR_IMAGE_SHA
-          docker push $AR_IMAGE_LATEST
+          docker tag "$IMAGE_SHA" "$AR_IMAGE_SHA"
+          docker tag "$IMAGE_SHA" "$AR_IMAGE_LATEST"
+          docker push "$AR_IMAGE_SHA"
+          docker push "$AR_IMAGE_LATEST"
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run deploy $SERVICE_NAME \
-            --image $AR_IMAGE_SHA \
-            --region $REGION \
-            --service-account $RUNTIME_SA \
+          gcloud run deploy "$SERVICE_NAME" \
+            --image "$AR_IMAGE_SHA" \
+            --region "$REGION" \
+            --service-account "$RUNTIME_SA" \
             --allow-unauthenticated \
-            --platform managed
+            --platform managed \
+            --port 8080 \
+            --max-instances 3 \
+            --timeout 300
 
-      - name: Show Cloud Run URL
-        run: gcloud run services describe $SERVICE_NAME --region $REGION --format='value(status.url)'
+      - name: Smoke check (Cloud Run, robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
+          echo "URL: $svc_url"
+
+          # Ждём Ready до 10 минут (120 попыток по 5 сек)
+          for i in $(seq 1 120); do
+            ready="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
+              --format='get(status.conditions[?type="Ready"].status)')"
+            echo "Waiting for Ready... (${i}/120)"
+            [ "$ready" = "True" ] && break || sleep 5
+          done
+          [ "${ready:-False}" = "True" ] || { echo "Service did not become Ready in time"; exit 1; }
+
+          check() {
+            local path="$1" expect="$2"
+            local max=10
+            for i in $(seq 1 $max); do
+              resp="$(curl -fsS -L "$svc_url$path" -w '\n%{http_code}' --connect-timeout 5 --max-time 10 || true)"
+              code="$(printf '%s\n' "$resp" | tail -n1)"
+              body="$(printf '%s\n' "$resp" | sed '$d')"
+              echo "[$path] http=$code payload=$(echo "$body" | head -c 120 | tr '\n' ' ')"
+              if [ "$code" = "200" ]; then
+                case "$expect" in
+                  ok)        printf '%s' "$body" | tr -d '\r' | grep -q '^ok$' && return 0 ;;
+                  has_token) printf '%s' "$body" | grep -q 'APP_TOKEN=' && return 0 ;;
+                esac
+              fi
+              sleep $(( i < 5 ? 2 : 5 ))
+            done
+            echo "Check $path failed after $max attempts"; echo "Last body:"; echo "$body"; return 1
+          }
+
+          # server.py отдаёт "ok" на /, /healthz, /ping; /info содержит APP_TOKEN
+          check "/"        ok
+          check "/healthz" ok
+          check "/info"    has_token
+          echo "Cloud Run smoke passed ✅"
+
+      - name: Debug — service/revision conditions & last logs (optional)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -x
+          gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
+            --format='yaml(spec.template.spec.containers[0].image,status.conditions,status.traffic)'
+
+          rev="$(gcloud run revisions list --service="$SERVICE_NAME" --region "$REGION" --format='value(name)' --limit=1)"
+          echo "Latest revision: $rev"
+          gcloud run revisions describe "$rev" --region "$REGION" --format='yaml(status.conditions)'
+
+          # Может потребоваться роль logs.viewer для деплой-СА
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.SERVICE_NAME }}"' \
+            --project "${{ env.PROJECT_ID }}" --limit 50 \
+            --format='value(timestamp, textPayload)' || true

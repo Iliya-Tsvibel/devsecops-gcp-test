@@ -2,7 +2,7 @@ name: build-scan-deploy
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -11,11 +11,11 @@ permissions:
 
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
-  REGION: ${{ vars.REGION }}                 # e.g. europe-west1
-  AR_HOST: ${{ vars.AR_HOST }}               # e.g. europe-west1-docker.pkg.dev
-  REPO: ${{ vars.REPO }}                     # e.g. services
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}     # e.g. devsecops-demo
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}         # runtime-sa@<project>.iam.gserviceaccount.com
+  REGION: ${{ vars.REGION }}
+  AR_HOST: ${{ vars.AR_HOST }} # e.g. europe-west1-docker.pkg.dev
+  REPO: ${{ vars.REPO }}       # e.g. services
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}   # e.g. devsecops-demo
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}       # runtime-sa@<project>.iam.gserviceaccount.com
 
   IMAGE_SHA: ${{ vars.SERVICE_NAME }}:${{ github.sha }}
   IMAGE_LATEST: ${{ vars.SERVICE_NAME }}:latest
@@ -25,10 +25,11 @@ env:
 jobs:
   build-scan-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Auth to GCP (OIDC)
+      - name: Auth to GCP via OIDC
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
@@ -38,33 +39,18 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker "$AR_HOST" --quiet
+        run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      # Dockerfile в корне репозитория
       - name: Build image
-        run: docker build -t "$IMAGE_SHA" -f Dockerfile .
+        # Dockerfile is at repo root
+        run: docker build -t "$IMAGE_SHA" .
 
-      # Локальная проверка образа на раннере — ловит ошибки ещё до деплоя
-      - name: Local smoke (container listens & endpoints)
-        run: |
-          set -euo pipefail
-          docker run -d --name app -p 8080:8080 "$IMAGE_SHA"
-          # ждём порт
-          for i in {1..20}; do
-            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:8080/ | grep -q '^ok$'
-          curl -fsS http://127.0.0.1:8080/healthz | grep -q '^ok$'
-          curl -fsS http://127.0.0.1:8080/info | grep -q 'APP_TOKEN=' || true  # локально секрета нет — не блокируем
-          docker rm -f app
-
-      # Без фейла пайплайна — только отчёт
+      # Vulnerability scan (report only; does NOT fail the pipeline)
       - name: Trivy scan (report only)
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
-          format: table
+          format: 'table'
           exit-code: '0'
           severity: 'HIGH,CRITICAL'
 
@@ -72,8 +58,8 @@ jobs:
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ env.IMAGE_SHA }}
-          format: cyclonedx
-          output: sbom.cdx.json
+          format: 'cyclonedx'
+          output: 'sbom.cdx.json'
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -109,22 +95,25 @@ jobs:
           svc_url="$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='value(status.url)')"
           echo "Testing URL: $svc_url"
 
-          # ждём Ready до 6 минут (72 * 5 сек)
+          echo "=== Service status before wait ==="
+          gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format='yaml(status)'
+
+          # wait up to 10 minutes for Ready=True (120 * 5s)
           attempts=0
           until gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
                  --format='get(status.conditions[?type="Ready"].status)' | grep -q '^True$'; do
             attempts=$((attempts+1))
-            if [ "$attempts" -gt 72 ]; then
+            if [ "$attempts" -gt 120 ]; then
               echo "Service did not become Ready in time" >&2
               exit 1
             fi
-            echo "Waiting for Ready... ($attempts/72)"
+            echo "Waiting for Ready... ($attempts/120)"
             sleep 5
           done
 
           check() {
             local path="$1" expect="$2"
-            local max=12
+            local max=15
             for i in $(seq 1 $max); do
               resp="$(curl -fsS -L "$svc_url$path" -w '\n%{http_code}' --connect-timeout 5 --max-time 10 || true)"
               code="$(printf '%s\n' "$resp" | tail -n1)"
@@ -136,29 +125,34 @@ jobs:
                   has_token) printf '%s' "$body" | grep -q 'APP_TOKEN=' && return 0 ;;
                 esac
               fi
-              sleep $(( i < 6 ? 3 : 6 ))
+              sleep $(( i < 7 ? 3 : 6 ))
             done
             echo "Check $path failed after $max attempts" >&2
             echo "Last body:"; echo "$body"
             return 1
           }
 
+          # your app: "/" and "/healthz" -> "ok", "/info" -> includes APP_TOKEN
           check "/"        ok
           check "/healthz" ok
           check "/info"    has_token
 
           echo "Cloud Run smoke passed ✅"
 
-      # Автосбор диагностики, если что-то упало
+      # Optional debug (doesn't fail the job). To see logs, the SA needs roles/logging.viewer.
       - name: Debug — service/revision conditions & logs
         if: failure()
+        continue-on-error: true
         run: |
           set -x
           gcloud run services describe "$SERVICE_NAME" --region "$REGION" \
             --format='yaml(spec.template.spec.containers[0].image,status.conditions,status.traffic)'
-          rev="$(gcloud run revisions list --service "$SERVICE_NAME" --region "$REGION" --format='value(name)' --limit=1)"
-          echo "Latest revision: $rev"
-          gcloud run revisions describe "$rev" --region "$REGION" --format='yaml(status.conditions)'
+
+          latest_rev="$(gcloud run revisions list --service="$SERVICE_NAME" --region "$REGION" --format='value(name)' --limit=1)"
+          echo "Latest revision: $latest_rev"
+          gcloud run revisions describe "$latest_rev" --region "$REGION" --format='yaml(status.conditions)'
+
+          echo "Last few request logs (requires roles/logging.viewer on the deploy SA):"
           gcloud logging read \
-            'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.SERVICE_NAME }}"' \
-            --project "$PROJECT_ID" --limit 50 --format='value(timestamp, textPayload)'
+            "resource.type=cloud_run_revision AND resource.labels.service_name=$SERVICE_NAME" \
+            --project "$PROJECT_ID" --limit 30 --format='value(timestamp,textPayload)' || true

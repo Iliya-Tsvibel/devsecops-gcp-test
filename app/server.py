@@ -3,10 +3,16 @@ import os
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/healthz":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+        # Отвечаем и на "/" и на "/healthz", чтобы Cloud Run не ругался
+        if self.path in ["/", "/healthz"]:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+
         token = os.getenv("APP_TOKEN", "not-set").encode()
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
         self.wfile.write(b"Hello from Cloud Run!\nAPP_TOKEN=" + token)
 
 if __name__ == "__main__":
